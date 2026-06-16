@@ -4,6 +4,7 @@
 // @version      0.1.1
 // @description  Collect and download/export signed video links for Fudan iCourse course playback videos.
 // @author       Codex
+// @license      MIT
 // @match        https://icourse.fudan.edu.cn/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
