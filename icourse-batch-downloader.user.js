@@ -37,6 +37,7 @@
     confirmed: Boolean(GM_getValue(STORAGE_KEYS.confirmed, false)),
     settings: Object.assign({
       streamPolicy: STREAM_POLICY_MAIN,
+      autoConfirmNotice: false,
       includeUnavailable: false
     }, safeJsonParse(GM_getValue(STORAGE_KEYS.settings, "{}"), {})),
     user: null,
@@ -98,6 +99,10 @@
             el("option", { value: STREAM_POLICY_MAIN }, ["默认主视频流"]),
             el("option", { value: STREAM_POLICY_ALL }, ["默认全部视频流"])
           ]),
+          el("label", { className: "icbd-toggle", title: "捕获链接时自动确认播放页资源规范提示" }, [
+            el("input", { type: "checkbox", "data-role": "auto-confirm-notice" }),
+            el("span", {}, ["自动确认规范提示"])
+          ]),
           el("button", { type: "button", "data-action": "refresh" }, ["刷新课程"]),
           el("button", { type: "button", "data-action": "expand-all" }, ["展开课程"]),
           el("button", { type: "button", "data-action": "collapse-all" }, ["折叠"])
@@ -138,7 +143,8 @@
       log: root.querySelector('[data-role="log"]'),
       stats: root.querySelector('[data-role="stats"]'),
       search: root.querySelector('[data-role="search"]'),
-      streamPolicy: root.querySelector('[data-role="stream-policy"]')
+      streamPolicy: root.querySelector('[data-role="stream-policy"]'),
+      autoConfirmNotice: root.querySelector('[data-role="auto-confirm-notice"]')
     };
   }
 
@@ -209,6 +215,13 @@
       state.settings.streamPolicy = target.value;
       GM_setValue(STORAGE_KEYS.settings, JSON.stringify(state.settings));
       applyStreamPolicyToLoadedStreams(true);
+      render();
+      return;
+    }
+    if (target.matches('[data-role="auto-confirm-notice"]')) {
+      state.settings.autoConfirmNotice = target.checked;
+      GM_setValue(STORAGE_KEYS.settings, JSON.stringify(state.settings));
+      log(target.checked ? "已开启自动确认规范提示" : "已关闭自动确认规范提示");
       render();
       return;
     }
@@ -652,6 +665,16 @@
         const text = doc.body?.innerText || "";
         if (/关于平台资源使用的规范提示/.test(text)) {
           confirmationRevealed = true;
+          if (state.settings.autoConfirmNotice) {
+            const attempted = attemptAutoConfirmPlatformNotice(doc);
+            if (attempted) {
+              if (iframe.dataset.icbdAutoConfirmLogged !== "1") {
+                iframe.dataset.icbdAutoConfirmLogged = "1";
+                log(`已尝试自动确认平台规范：${task.sub.title} / ${task.stream.label}`);
+              }
+              return;
+            }
+          }
           revealCaptureFrame(iframe, task);
           return;
         }
@@ -662,6 +685,33 @@
         }
       }, 800);
     });
+  }
+
+  function attemptAutoConfirmPlatformNotice(doc) {
+    const bodyText = doc.body?.innerText || "";
+    if (!/我已阅读并严格遵守以上平台使用的规范声明/.test(bodyText)) return false;
+
+    let acted = false;
+    const checkbox = Array.from(doc.querySelectorAll('input[type="checkbox"]'))
+      .find((input) => {
+        const container = input.closest("label,.el-checkbox,.el-checkbox__input,.el-checkbox__original") || input.parentElement;
+        return !container || /我已阅读并严格遵守以上平台使用的规范声明/.test(container.innerText || bodyText);
+      });
+
+    if (checkbox && !checkbox.checked) {
+      const clickable = checkbox.closest("label,.el-checkbox,.el-checkbox__input") || checkbox;
+      clickable.click();
+      acted = true;
+    }
+
+    const confirmButton = Array.from(doc.querySelectorAll("button"))
+      .find((button) => (button.innerText || button.textContent || "").trim() === "确认");
+    if (confirmButton && !confirmButton.disabled && confirmButton.getAttribute("aria-disabled") !== "true") {
+      confirmButton.click();
+      acted = true;
+    }
+
+    return acted;
   }
 
   function revealCaptureFrame(iframe, task) {
@@ -852,6 +902,7 @@
   function render() {
     if (!ui) return;
     ui.streamPolicy.value = state.settings.streamPolicy;
+    ui.autoConfirmNotice.checked = Boolean(state.settings.autoConfirmNotice);
     ui.search.value = state.filter;
     renderTree();
     renderStats();
@@ -1257,6 +1308,8 @@
       .icbd-toolbar button:hover, .icbd-card button:hover, .icbd-actions button:hover { background: #f8fafc; }
       .icbd-search { flex: 1; min-width: 220px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; }
       .icbd-select { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; background: #fff; }
+      .icbd-toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 7px 9px; background: #fff; white-space: nowrap; cursor: pointer; }
+      .icbd-toggle input { margin: 0; }
       .icbd-main { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 0; flex: 1; }
       .icbd-tree { overflow: auto; padding: 12px 20px 24px; background: #f8fafc; }
       .icbd-side { overflow: auto; padding: 12px; border-left: 1px solid #e5e7eb; background: #fff; }
