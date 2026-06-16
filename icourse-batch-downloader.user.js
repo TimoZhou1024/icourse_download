@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         iCourse Batch Video Downloader
 // @namespace    https://icourse.fudan.edu.cn/
-// @version      0.1.0
+// @version      0.1.1
 // @description  Collect and download/export signed video links for Fudan iCourse course playback videos.
 // @author       Codex
 // @match        https://icourse.fudan.edu.cn/*
@@ -13,6 +13,8 @@
 // @grant        GM_notification
 // @grant        GM_addStyle
 // @connect      icourse.fudan.edu.cn
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -38,7 +40,10 @@
     settings: Object.assign({
       streamPolicy: STREAM_POLICY_MAIN,
       autoConfirmNotice: false,
-      includeUnavailable: false
+      includeUnavailable: false,
+      aria2RpcUrl: "http://127.0.0.1:16800/jsonrpc",
+      aria2RpcToken: "",
+      aria2DownloadDir: ""
     }, safeJsonParse(GM_getValue(STORAGE_KEYS.settings, "{}"), {})),
     user: null,
     courses: [],
@@ -118,11 +123,30 @@
               el("button", { type: "button", "data-action": "refresh-signed" }, ["刷新 signed URL"])
             ]),
             el("div", { className: "icbd-card" }, [
+              el("h3", {}, ["下载器"]),
+              el("label", { className: "icbd-field" }, [
+                el("span", {}, ["Motrix/aria2 RPC"]),
+                el("input", { type: "text", "data-role": "aria2-rpc-url", placeholder: "http://127.0.0.1:16800/jsonrpc" })
+              ]),
+              el("label", { className: "icbd-field" }, [
+                el("span", {}, ["RPC Token"]),
+                el("input", { type: "password", "data-role": "aria2-rpc-token", placeholder: "未设置则留空" })
+              ]),
+              el("label", { className: "icbd-field" }, [
+                el("span", {}, ["保存目录"]),
+                el("input", { type: "text", "data-role": "aria2-download-dir", placeholder: "可选，例如 D:/Videos" })
+              ]),
+              el("button", { type: "button", "data-action": "send-aria2" }, ["发送到 Motrix/aria2"])
+            ]),
+            el("div", { className: "icbd-card" }, [
               el("h3", {}, ["导出"]),
               el("button", { type: "button", "data-action": "export-json" }, ["导出 JSON"]),
               el("button", { type: "button", "data-action": "export-csv" }, ["导出 CSV"]),
               el("button", { type: "button", "data-action": "export-txt" }, ["导出 TXT"]),
-              el("button", { type: "button", "data-action": "export-ps1" }, ["导出下载 PowerShell"])
+              el("button", { type: "button", "data-action": "export-ps1" }, ["导出下载 PowerShell"]),
+              el("button", { type: "button", "data-action": "export-parallel-ps1" }, ["导出并行 PowerShell"]),
+              el("button", { type: "button", "data-action": "export-aria2" }, ["导出 aria2c 清单"]),
+              el("button", { type: "button", "data-action": "export-idm-ps1" }, ["导出 IDM PowerShell"])
             ]),
             el("div", { className: "icbd-card" }, [
               el("h3", {}, ["状态"]),
@@ -144,7 +168,10 @@
       stats: root.querySelector('[data-role="stats"]'),
       search: root.querySelector('[data-role="search"]'),
       streamPolicy: root.querySelector('[data-role="stream-policy"]'),
-      autoConfirmNotice: root.querySelector('[data-role="auto-confirm-notice"]')
+      autoConfirmNotice: root.querySelector('[data-role="auto-confirm-notice"]'),
+      aria2RpcUrl: root.querySelector('[data-role="aria2-rpc-url"]'),
+      aria2RpcToken: root.querySelector('[data-role="aria2-rpc-token"]'),
+      aria2DownloadDir: root.querySelector('[data-role="aria2-download-dir"]')
     };
   }
 
@@ -203,10 +230,14 @@
     if (action === "collect-selected") collectSelectedSignedUrls(false).catch(reportError);
     if (action === "refresh-signed") collectSelectedSignedUrls(true).catch(reportError);
     if (action === "download-selected") downloadSelected().catch(reportError);
+    if (action === "send-aria2") sendSelectedToAria2().catch(reportError);
     if (action === "export-json") exportSelected("json");
     if (action === "export-csv") exportSelected("csv");
     if (action === "export-txt") exportSelected("txt");
     if (action === "export-ps1") exportSelected("ps1");
+    if (action === "export-parallel-ps1") exportSelected("parallel-ps1");
+    if (action === "export-aria2") exportSelected("aria2");
+    if (action === "export-idm-ps1") exportSelected("idm-ps1");
   }
 
   function handleChange(event) {
@@ -223,6 +254,21 @@
       GM_setValue(STORAGE_KEYS.settings, JSON.stringify(state.settings));
       log(target.checked ? "已开启自动确认规范提示" : "已关闭自动确认规范提示");
       render();
+      return;
+    }
+    if (target.matches('[data-role="aria2-rpc-url"]')) {
+      state.settings.aria2RpcUrl = target.value.trim() || "http://127.0.0.1:16800/jsonrpc";
+      GM_setValue(STORAGE_KEYS.settings, JSON.stringify(state.settings));
+      return;
+    }
+    if (target.matches('[data-role="aria2-rpc-token"]')) {
+      state.settings.aria2RpcToken = target.value.trim();
+      GM_setValue(STORAGE_KEYS.settings, JSON.stringify(state.settings));
+      return;
+    }
+    if (target.matches('[data-role="aria2-download-dir"]')) {
+      state.settings.aria2DownloadDir = target.value.trim();
+      GM_setValue(STORAGE_KEYS.settings, JSON.stringify(state.settings));
       return;
     }
     if (target.matches('[data-role="compliance-check"]')) {
@@ -793,6 +839,88 @@
     });
   }
 
+  async function sendSelectedToAria2() {
+    const tasks = getSelectedStreams();
+    if (!tasks.length) {
+      log("没有选择视频流");
+      return;
+    }
+    await collectSelectedSignedUrls(false);
+    const rows = getSelectedStreams().map(taskToExportRow);
+    const endpoint = state.settings.aria2RpcUrl || "http://127.0.0.1:16800/jsonrpc";
+    let added = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      const url = row.signedUrl || row.rawUrl;
+      if (!url) {
+        skipped += 1;
+        continue;
+      }
+      if (!row.signedUrl) {
+        skipped += 1;
+        log(`跳过未捕获 signed URL 的任务：${row.subTitle} / ${row.streamLabel}`, "warn");
+        continue;
+      }
+      if (row.isM3u8 || /\.m3u8(\?|$)/i.test(url)) {
+        skipped += 1;
+        log(`跳过 HLS：${row.subTitle} / ${row.streamLabel}，请使用 yt-dlp 或导出 PowerShell`, "warn");
+        continue;
+      }
+      try {
+        await aria2AddUri(endpoint, row);
+        added += 1;
+        log(`已发送到 Motrix/aria2：${row.subTitle} / ${row.streamLabel}`);
+      } catch (error) {
+        log(`发送到 Motrix/aria2 失败：${row.subTitle} / ${error.message || error}`, "warn");
+      }
+    }
+    log(`Motrix/aria2 发送完成：${added} 个任务${skipped ? `，跳过 ${skipped} 个` : ""}`);
+  }
+
+  function aria2AddUri(endpoint, row) {
+    const options = aria2OptionsForRow(row);
+    const params = [[row.signedUrl || row.rawUrl], options];
+    const token = state.settings.aria2RpcToken || "";
+    if (token) params.unshift(`token:${token}`);
+    return gmJsonRpc(endpoint, {
+      jsonrpc: "2.0",
+      id: `icbd-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      method: "aria2.addUri",
+      params
+    });
+  }
+
+  function aria2OptionsForRow(row) {
+    const filename = row.filename.replace(/\\/g, "/");
+    const slash = filename.lastIndexOf("/");
+    const relativeDir = slash >= 0 ? filename.slice(0, slash) : "";
+    const out = slash >= 0 ? filename.slice(slash + 1) : filename;
+    const baseDir = String(state.settings.aria2DownloadDir || "").trim().replace(/[\\/]$/, "");
+    const options = {
+      header: [
+        `User-Agent: ${navigator.userAgent}`,
+        `Referer: ${row.livingroomUrl}`,
+        "Accept: */*"
+      ],
+      "check-certificate": "false",
+      "all-proxy": "",
+      "http-proxy": "",
+      "https-proxy": "",
+      "no-proxy": "*",
+      "async-dns": "false",
+      continue: "false",
+      split: "1",
+      "max-connection-per-server": "1",
+      out
+    };
+    if (baseDir) {
+      options.dir = relativeDir ? `${baseDir}/${relativeDir}` : baseDir;
+    } else if (relativeDir) {
+      options.out = filename;
+    }
+    return options;
+  }
+
   function exportSelected(format) {
     const tasks = getSelectedStreams();
     if (!tasks.length) {
@@ -820,6 +948,15 @@
     } else if (format === "ps1") {
       filename = `icourse-download-${formatTimestamp(new Date())}.ps1`;
       content = toPowerShell(rows);
+    } else if (format === "parallel-ps1") {
+      filename = `icourse-parallel-download-${formatTimestamp(new Date())}.ps1`;
+      content = toParallelPowerShell(rows);
+    } else if (format === "aria2") {
+      filename = `icourse-aria2-${formatTimestamp(new Date())}.txt`;
+      content = toAria2Input(rows);
+    } else if (format === "idm-ps1") {
+      filename = `icourse-idm-${formatTimestamp(new Date())}.ps1`;
+      content = toIdmPowerShell(rows);
     }
 
     downloadText(content, filename, mime);
@@ -891,6 +1028,160 @@
     return lines.join("\n");
   }
 
+  function toParallelPowerShell(rows) {
+    const payload = rows.map((row) => ({
+      url: row.signedUrl || row.rawUrl,
+      output: row.filename,
+      referer: row.livingroomUrl,
+      userAgent: navigator.userAgent,
+      isM3u8: row.isM3u8 || /\.m3u8(\?|$)/i.test(row.signedUrl || row.rawUrl),
+      title: `${row.termName} / ${row.courseTitle} / ${row.subTitle} / ${row.streamLabel}`,
+      hasSignedUrl: Boolean(row.signedUrl)
+    }));
+    return [
+      "# Generated by iCourse Batch Video Downloader",
+      "# Faster MP4 downloader. PowerShell 7+ runs downloads in parallel; Windows PowerShell 5 falls back to serial.",
+      "# Run with: pwsh .\\icourse-parallel-download-*.ps1",
+      "# Tune this value based on network/server behavior.",
+      "# If downloads fail with connection resets or server throttling, reduce it to 2.",
+      "$ThrottleLimit = 4",
+      "$ErrorActionPreference = 'Stop'",
+      "",
+      "$Jobs = @'",
+      JSON.stringify(payload, null, 2),
+      "'@ | ConvertFrom-Json",
+      "",
+      "$DownloadOne = {",
+      "  param($Job)",
+      "  $dir = Split-Path -Parent $Job.output",
+      "  if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
+      "  if ($Job.isM3u8) {",
+      "    & yt-dlp --proxy \"\" --continue --no-part --referer $Job.referer --user-agent $Job.userAgent -o $Job.output $Job.url",
+      "    if ($LASTEXITCODE -ne 0) { throw \"yt-dlp failed with exit code $LASTEXITCODE for $($Job.output)\" }",
+      "  } else {",
+      "    & curl.exe --noproxy '*' --location --fail --retry 3 --retry-delay 2 --ssl-no-revoke --http1.1 `",
+      "      --header \"User-Agent: $($Job.userAgent)\" `",
+      "      --header \"Referer: $($Job.referer)\" `",
+      "      --header \"Accept: */*\" `",
+      "      --output $Job.output `",
+      "      $Job.url",
+      "    if ($LASTEXITCODE -ne 0) { throw \"curl.exe failed with exit code $LASTEXITCODE for $($Job.output)\" }",
+      "  }",
+      "}",
+      "",
+      "if ($PSVersionTable.PSVersion.Major -ge 7) {",
+      "  $Jobs | ForEach-Object -Parallel {",
+      "    $Job = $_",
+      "    $dir = Split-Path -Parent $Job.output",
+      "    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
+      "    if ($Job.isM3u8) {",
+      "      & yt-dlp --proxy \"\" --continue --no-part --referer $Job.referer --user-agent $Job.userAgent -o $Job.output $Job.url",
+      "      if ($LASTEXITCODE -ne 0) { throw \"yt-dlp failed with exit code $LASTEXITCODE for $($Job.output)\" }",
+      "    } else {",
+      "      & curl.exe --noproxy '*' --location --fail --retry 3 --retry-delay 2 --ssl-no-revoke --http1.1 `",
+      "        --header \"User-Agent: $($Job.userAgent)\" `",
+      "        --header \"Referer: $($Job.referer)\" `",
+      "        --header \"Accept: */*\" `",
+      "        --output $Job.output `",
+      "        $Job.url",
+      "      if ($LASTEXITCODE -ne 0) { throw \"curl.exe failed with exit code $LASTEXITCODE for $($Job.output)\" }",
+      "    }",
+      "  } -ThrottleLimit $ThrottleLimit",
+      "} else {",
+      "  Write-Warning 'PowerShell 7+ is required for true parallel downloads. Falling back to serial mode.'",
+      "  foreach ($Job in $Jobs) { & $DownloadOne $Job }",
+      "}",
+      ""
+    ].join("\n");
+  }
+
+  function toAria2Input(rows) {
+    const lines = [
+      "# aria2c input generated by iCourse Batch Video Downloader",
+      "# Stable command tested for iCourse signed MP4:",
+      "# aria2c --no-conf=true --async-dns=false --all-proxy= --http-proxy= --https-proxy= --no-proxy=\"*\" --max-concurrent-downloads=4 --split=1 --max-connection-per-server=1 --continue=false --auto-file-renaming=false --allow-overwrite=true --input-file=icourse-aria2-*.txt",
+      "# Do not use segmented Range mode for current iCourse signed MP4; direct Range requests returned 403 in tests.",
+      "# Motrix can usually import this file as an aria2 task list.",
+      ""
+    ];
+    for (const row of rows) {
+      const url = row.signedUrl || row.rawUrl;
+      const filename = row.filename.replace(/\\/g, "/");
+      const slash = filename.lastIndexOf("/");
+      const dir = slash >= 0 ? filename.slice(0, slash) : ".";
+      const out = slash >= 0 ? filename.slice(slash + 1) : filename;
+      lines.push(`# ${row.termName} / ${row.courseTitle} / ${row.subTitle} / ${row.streamLabel}`);
+      if (!row.signedUrl) lines.push("# WARNING: no signed URL captured yet; raw URL may not download directly.");
+      lines.push(url);
+      lines.push(`  dir=${dir || "."}`);
+      lines.push(`  out=${out}`);
+      lines.push(`  header=User-Agent: ${navigator.userAgent}`);
+      lines.push(`  header=Referer: ${row.livingroomUrl}`);
+      lines.push("  header=Accept: */*");
+      lines.push("  check-certificate=false");
+      lines.push("  all-proxy=");
+      lines.push("  http-proxy=");
+      lines.push("  https-proxy=");
+      lines.push("  no-proxy=*");
+      lines.push("  async-dns=false");
+      lines.push("  continue=false");
+      lines.push("  split=1");
+      lines.push("  max-connection-per-server=1");
+      lines.push("");
+    }
+    return lines.join("\n");
+  }
+
+  function toIdmPowerShell(rows) {
+    const payload = rows.map((row) => ({
+      url: row.signedUrl || row.rawUrl,
+      output: row.filename,
+      isM3u8: row.isM3u8 || /\.m3u8(\?|$)/i.test(row.signedUrl || row.rawUrl),
+      title: `${row.termName} / ${row.courseTitle} / ${row.subTitle} / ${row.streamLabel}`,
+      hasSignedUrl: Boolean(row.signedUrl)
+    }));
+    return [
+      "# Generated by iCourse Batch Video Downloader",
+      "# Adds direct MP4 links to Internet Download Manager. HLS/m3u8 rows are skipped.",
+      "# IDM command-line mode cannot attach custom Referer/User-Agent headers; use signed MP4 URLs.",
+      "$ErrorActionPreference = 'Stop'",
+      "",
+      "$IdmCandidates = @()",
+      "if (${env:ProgramFiles(x86)}) { $IdmCandidates += (Join-Path ${env:ProgramFiles(x86)} 'Internet Download Manager\\IDMan.exe') }",
+      "if ($env:ProgramFiles) { $IdmCandidates += (Join-Path $env:ProgramFiles 'Internet Download Manager\\IDMan.exe') }",
+      "$Idm = $IdmCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1",
+      "if (-not $Idm) {",
+      "  $command = Get-Command IDMan.exe -ErrorAction SilentlyContinue",
+      "  if ($command) { $Idm = $command.Source }",
+      "}",
+      "if (-not $Idm) { throw 'Cannot find IDMan.exe. Install IDM or add it to PATH.' }",
+      "",
+      "$Jobs = @'",
+      JSON.stringify(payload, null, 2),
+      "'@ | ConvertFrom-Json",
+      "",
+      "foreach ($Job in $Jobs) {",
+      "  if ($Job.isM3u8) {",
+      "    Write-Warning \"Skipping HLS/m3u8: $($Job.title)\"",
+      "    continue",
+      "  }",
+      "  if (-not $Job.hasSignedUrl) {",
+      "    Write-Warning \"Skipping unsigned URL: $($Job.title)\"",
+      "    continue",
+      "  }",
+      "  $dir = Split-Path -Parent $Job.output",
+      "  $file = Split-Path -Leaf $Job.output",
+      "  if (-not $dir) { $dir = '.' }",
+      "  if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }",
+      "  $resolvedDir = (Resolve-Path -LiteralPath $dir).Path",
+      "  & $Idm /d $Job.url /p $resolvedDir /f $file /n /a",
+      "  if ($LASTEXITCODE -ne 0) { Write-Warning \"IDM returned exit code $LASTEXITCODE for $($Job.output)\" }",
+      "}",
+      "& $Idm /s",
+      ""
+    ].join("\n");
+  }
+
   function toCsv(rows) {
     const headers = Object.keys(rows[0] || {});
     return [
@@ -903,6 +1194,9 @@
     if (!ui) return;
     ui.streamPolicy.value = state.settings.streamPolicy;
     ui.autoConfirmNotice.checked = Boolean(state.settings.autoConfirmNotice);
+    ui.aria2RpcUrl.value = state.settings.aria2RpcUrl || "http://127.0.0.1:16800/jsonrpc";
+    ui.aria2RpcToken.value = state.settings.aria2RpcToken || "";
+    ui.aria2DownloadDir.value = state.settings.aria2DownloadDir || "";
     ui.search.value = state.filter;
     renderTree();
     renderStats();
@@ -1150,6 +1444,39 @@
     }
   }
 
+  function gmJsonRpc(url, payload) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "POST",
+        url,
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        data: JSON.stringify(payload),
+        timeout: 10000,
+        onload: (response) => {
+          if (response.status < 200 || response.status >= 300) {
+            reject(new Error(`RPC HTTP ${response.status}`));
+            return;
+          }
+          const data = safeJsonParse(response.responseText, null);
+          if (!data) {
+            reject(new Error("RPC 响应不是 JSON"));
+            return;
+          }
+          if (data.error) {
+            reject(new Error(data.error.message || JSON.stringify(data.error)));
+            return;
+          }
+          resolve(data.result);
+        },
+        onerror: () => reject(new Error("无法连接到本机 RPC，请确认 Motrix/aria2 已启动并开启 RPC")),
+        ontimeout: () => reject(new Error("连接本机 RPC 超时"))
+      });
+    });
+  }
+
   function installNetworkObserver() {
     const originalFetch = window.fetch;
     window.fetch = async function observedFetch(...args) {
@@ -1310,10 +1637,13 @@
       .icbd-select { border: 1px solid #cbd5e1; border-radius: 6px; padding: 8px 10px; background: #fff; }
       .icbd-toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #cbd5e1; border-radius: 6px; padding: 7px 9px; background: #fff; white-space: nowrap; cursor: pointer; }
       .icbd-toggle input { margin: 0; }
-      .icbd-main { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 0; flex: 1; }
+      .icbd-main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; min-height: 0; flex: 1; }
       .icbd-tree { overflow: auto; padding: 12px 20px 24px; background: #f8fafc; }
       .icbd-side { overflow: auto; padding: 12px; border-left: 1px solid #e5e7eb; background: #fff; }
       .icbd-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #fff; }
+      .icbd-field { display: block; margin-top: 8px; }
+      .icbd-field span { display: block; margin-bottom: 4px; color: #64748b; font-size: 12px; }
+      .icbd-field input { width: 100%; box-sizing: border-box; border: 1px solid #cbd5e1; border-radius: 6px; padding: 7px 8px; font: inherit; }
       .icbd-term { margin-bottom: 14px; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; overflow: hidden; }
       .icbd-term-title { padding: 10px 12px; background: #eef2f7; font-weight: 600; }
       .icbd-row { display: flex; align-items: center; gap: 8px; min-height: 36px; }
