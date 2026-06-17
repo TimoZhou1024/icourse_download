@@ -52,6 +52,7 @@
     courseDetails: new Map(),
     subInfos: new Map(),
     selections: new Set(),
+    courseSelectionJobs: new Map(),
     expandedCourses: new Set(),
     expandedSubs: new Set(),
     logs: [],
@@ -603,11 +604,45 @@
   }
 
   async function selectCourse(courseId, checked) {
-    const detail = await loadCourseDetail(courseId);
-    for (const sub of detail.subs) {
-      await selectSub(getSubKey(sub), checked, false);
+    const existingJob = state.courseSelectionJobs.get(courseId);
+    if (existingJob && !existingJob.cancelled) {
+      existingJob.cancelled = true;
+      deselectLoadedCourseStreams(courseId);
+      log("已取消课程批量解析，并清除已选中的该课程视频流");
+      render();
+      return;
     }
+
+    if (!checked) {
+      deselectLoadedCourseStreams(courseId);
+      render();
+      return;
+    }
+
+    const job = { courseId, cancelled: false, startedAt: Date.now() };
+    state.courseSelectionJobs.set(courseId, job);
     render();
+    try {
+      const detail = await loadCourseDetail(courseId);
+      if (!isActiveCourseSelectionJob(courseId, job)) return;
+
+      const selectableSubs = detail.subs.filter((sub) => sub.available);
+      for (const sub of selectableSubs) {
+        if (!isActiveCourseSelectionJob(courseId, job)) break;
+        const info = await loadSubInfo(sub);
+        if (!isActiveCourseSelectionJob(courseId, job)) {
+          deselectInfoStreams(info);
+          break;
+        }
+        selectInfoStreams(info, true);
+        render();
+      }
+    } finally {
+      if (state.courseSelectionJobs.get(courseId) === job) {
+        state.courseSelectionJobs.delete(courseId);
+      }
+      render();
+    }
   }
 
   async function selectSub(subKey, checked, shouldRender = true) {
@@ -625,6 +660,30 @@
       }
     }
     if (shouldRender) render();
+  }
+
+  function isActiveCourseSelectionJob(courseId, job) {
+    return state.courseSelectionJobs.get(courseId) === job && !job.cancelled;
+  }
+
+  function selectInfoStreams(info, checked) {
+    for (const stream of info.streams) {
+      if (checked) {
+        if (state.settings.streamPolicy === STREAM_POLICY_ALL || stream.isMain) state.selections.add(stream.id);
+      } else {
+        state.selections.delete(stream.id);
+      }
+    }
+  }
+
+  function deselectInfoStreams(info) {
+    selectInfoStreams(info, false);
+  }
+
+  function deselectLoadedCourseStreams(courseId) {
+    for (const info of state.subInfos.values()) {
+      if (info.sub.courseId === courseId) deselectInfoStreams(info);
+    }
   }
 
   async function collectSelectedSignedUrls(force) {
@@ -1228,14 +1287,17 @@
   function renderCourse(course) {
     const expanded = state.expandedCourses.has(course.id);
     const detail = state.courseDetails.get(course.id);
+    const courseJob = state.courseSelectionJobs.get(course.id);
+    const selecting = Boolean(courseJob && !courseJob.cancelled);
     const courseSelection = getCourseSelectionState(course.id);
     const checkbox = el("input", {
       type: "checkbox",
+      title: selecting ? "正在解析该课程，再次点击可取消" : "",
       "data-action": "select-course",
       "data-course-id": course.id
     });
     checkbox.checked = courseSelection.checked;
-    checkbox.indeterminate = courseSelection.indeterminate;
+    checkbox.indeterminate = selecting || courseSelection.indeterminate;
 
     const children = [];
     if (expanded) {
@@ -1256,7 +1318,7 @@
           el("strong", {}, [course.title || course.id]),
           el("span", { className: "icbd-muted" }, [`${course.teacher || "未知教师"} ${course.structureName || ""}`])
         ]),
-        el("span", { className: "icbd-badge" }, [course.progress ? `进度 ${Math.round(Number(course.progress.subjectProgress || 0) * 100)}%` : ""])
+        el("span", { className: `icbd-badge ${selecting ? "icbd-warn" : ""}` }, [selecting ? "解析中" : course.progress ? `进度 ${Math.round(Number(course.progress.subjectProgress || 0) * 100)}%` : ""])
       ]),
       ...children
     ]);
